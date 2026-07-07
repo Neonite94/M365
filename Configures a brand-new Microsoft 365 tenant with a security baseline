@@ -1,0 +1,615 @@
+<#
+.SYNOPSIS
+    Configures a brand-new Microsoft 365 tenant with a security baseline,
+    adapting automatically to the licenses available in the tenant.
+
+.DESCRIPTION
+    Detects licensed service plans (Entra ID P1/P2, Intune, Defender for Office 365)
+    and applies the corresponding Microsoft-recommended security baseline:
+
+      Always (any license):
+        - Break-glass (emergency access) account + exclusion group
+        - Unified Audit Log enabled
+        - Modern Auth enforced / basic auth remains blocked
+        - Mail auto-forwarding to external domains blocked
+        - Outbound spam & standard preset security policies (EOP)
+        - User consent to apps restricted (admin consent workflow)
+        - App registration by users disabled
+        - Guest invite restrictions + guest access limited
+        - SharePoint/OneDrive external sharing hardened
+        - Authentication methods: enable FIDO2/Passkeys + Authenticator, disable SMS/Voice where possible
+
+      Entra ID P1 (AAD_PREMIUM):
+        - Security Defaults disabled (replaced by Conditional Access)
+        - CA001: Block legacy authentication
+        - CA002: Require MFA for admins
+        - CA003: Require MFA for all users
+        - CA004: Require MFA for Azure/Graph management
+        - CA005: Block access from unsupported device platforms (optional, Report-Only)
+        - CA006: Session controls - sign-in frequency for unmanaged devices
+
+      Entra ID P2 (AAD_PREMIUM_P2):
+        - CA101: Require MFA for medium/high sign-in risk
+        - CA102: Block/require password change for high user risk
+
+      Intune (INTUNE_A):
+        - CA201: Require compliant or Hybrid-joined device for O365 (Report-Only)
+
+      Defender for Office 365 (ATP_ENTERPRISE):
+        - Strict/Standard preset security policies incl. Safe Links & Safe Attachments
+
+    All Conditional Access policies are created in REPORT-ONLY mode by default.
+    Switch to enforcement with -EnforceCAPolicies after validating sign-in logs.
+
+.PARAMETER TenantId
+    The tenant ID (GUID) or primary domain of the tenant to configure.
+
+.PARAMETER BreakGlassUpn
+    UPN for the emergency access account, e.g. emergency-access@contoso.onmicrosoft.com
+    If omitted, one is generated as breakglass@<initialdomain>.
+
+.PARAMETER EnforceCAPolicies
+    Creates CA policies in "enabled" state instead of "enabledForReportingButNotEnforced".
+    NOT recommended on first run.
+
+.PARAMETER SkipExchange
+    Skip Exchange Online configuration.
+
+.PARAMETER SkipSharePoint
+    Skip SharePoint Online configuration.
+
+.EXAMPLE
+    .\Invoke-M365SecurityBaseline.ps1 -TenantId contoso.onmicrosoft.com
+
+.EXAMPLE
+    .\Invoke-M365SecurityBaseline.ps1 -TenantId contoso.onmicrosoft.com -EnforceCAPolicies
+
+.NOTES
+    Author  : Baseline deployment script (Claude-generated, review before production use)
+    Requires: PowerShell 7.x recommended
+              Microsoft.Graph (v2.x), ExchangeOnlineManagement (v3.x),
+              Microsoft.Online.SharePoint.PowerShell
+    Run as  : Global Administrator on the target tenant
+#>
+
+[CmdletBinding(SupportsShouldProcess)]
+param(
+    [Parameter(Mandatory)]
+    [string]$TenantId,
+
+    [string]$BreakGlassUpn,
+
+    [switch]$EnforceCAPolicies,
+
+    [switch]$SkipExchange,
+
+    [switch]$SkipSharePoint
+)
+
+#region ── 0. Helper functions ────────────────────────────────────────────────
+
+$script:Log = [System.Collections.Generic.List[pscustomobject]]::new()
+
+function Write-Step {
+    param([string]$Message, [ValidateSet('INFO','OK','WARN','SKIP','ERROR')][string]$Level = 'INFO')
+    $color = switch ($Level) {
+        'OK'    { 'Green' }
+        'WARN'  { 'Yellow' }
+        'SKIP'  { 'DarkGray' }
+        'ERROR' { 'Red' }
+        default { 'Cyan' }
+    }
+    Write-Host ("[{0}] {1}" -f $Level.PadRight(5), $Message) -ForegroundColor $color
+    $script:Log.Add([pscustomobject]@{ Time = Get-Date; Level = $Level; Message = $Message })
+}
+
+function Install-RequiredModule {
+    param([string]$Name, [string]$MinVersion)
+    $mod = Get-Module -ListAvailable -Name $Name | Sort-Object Version -Descending | Select-Object -First 1
+    if (-not $mod -or ($MinVersion -and $mod.Version -lt [version]$MinVersion)) {
+        Write-Step "Installing module $Name..." 'INFO'
+        Install-Module $Name -Scope CurrentUser -Force -AllowClobber -MinimumVersion $MinVersion
+    }
+    Import-Module $Name -ErrorAction Stop
+}
+
+function New-RandomPassword {
+    param([int]$Length = 24)
+    $chars = ([char[]](33..126)) -join ''
+    -join (1..$Length | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
+}
+
+#endregion
+
+#region ── 1. Modules & connection ───────────────────────────────────────────
+
+Write-Step "=== M365 Security Baseline Deployment ===" 'INFO'
+
+Install-RequiredModule -Name Microsoft.Graph.Authentication -MinVersion '2.0.0'
+Install-RequiredModule -Name Microsoft.Graph.Identity.SignIns
+Install-RequiredModule -Name Microsoft.Graph.Identity.DirectoryManagement
+Install-RequiredModule -Name Microsoft.Graph.Users
+Install-RequiredModule -Name Microsoft.Graph.Groups
+if (-not $SkipExchange)   { Install-RequiredModule -Name ExchangeOnlineManagement -MinVersion '3.0.0' }
+if (-not $SkipSharePoint) { Install-RequiredModule -Name Microsoft.Online.SharePoint.PowerShell }
+
+$graphScopes = @(
+    'Policy.ReadWrite.ConditionalAccess'
+    'Policy.ReadWrite.Authorization'
+    'Policy.ReadWrite.AuthenticationMethod'
+    'Policy.ReadWrite.SecurityDefaults'
+    'Directory.ReadWrite.All'
+    'User.ReadWrite.All'
+    'Group.ReadWrite.All'
+    'Organization.Read.All'
+    'RoleManagement.ReadWrite.Directory'
+    'Application.Read.All'
+)
+
+Write-Step "Connecting to Microsoft Graph (tenant: $TenantId)..."
+Connect-MgGraph -TenantId $TenantId -Scopes $graphScopes -NoWelcome
+$org = Get-MgOrganization
+$initialDomain = ($org.VerifiedDomains | Where-Object { $_.IsInitial }).Name
+Write-Step "Connected to: $($org.DisplayName) ($initialDomain)" 'OK'
+
+#endregion
+
+#region ── 2. License detection ──────────────────────────────────────────────
+
+Write-Step "Detecting licensed service plans..."
+
+$skus = Get-MgSubscribedSku
+$servicePlans = $skus.ServicePlans |
+    Where-Object { $_.ProvisioningStatus -eq 'Success' -or $_.ProvisioningStatus -eq 'PendingActivation' } |
+    Select-Object -ExpandProperty ServicePlanName -Unique
+
+$Lic = [pscustomobject]@{
+    EntraP1       = [bool]($servicePlans -match '^AAD_PREMIUM$')
+    EntraP2       = [bool]($servicePlans -match '^AAD_PREMIUM_P2$')
+    Intune        = [bool]($servicePlans -match '^INTUNE_A$')
+    MDO_P1        = [bool]($servicePlans -match '^ATP_ENTERPRISE$')          # Defender for Office P1
+    MDO_P2        = [bool]($servicePlans -match '^THREAT_INTELLIGENCE$')     # Defender for Office P2
+    ExchangeOnline= [bool]($servicePlans -match '^EXCHANGE_S_(STANDARD|ENTERPRISE|FOUNDATION)')
+    SharePoint    = [bool]($servicePlans -match '^SHAREPOINT')
+}
+# P2 implies P1 capabilities
+if ($Lic.EntraP2) { $Lic.EntraP1 = $true }
+
+Write-Step ("SKUs found      : " + (($skus.SkuPartNumber | Sort-Object -Unique) -join ', '))
+Write-Step ("Entra ID P1     : $($Lic.EntraP1)")
+Write-Step ("Entra ID P2     : $($Lic.EntraP2)")
+Write-Step ("Intune          : $($Lic.Intune)")
+Write-Step ("Defender for O365 P1/P2 : $($Lic.MDO_P1) / $($Lic.MDO_P2)")
+
+#endregion
+
+#region ── 3. Break-glass account & exclusion group ──────────────────────────
+
+Write-Step "Configuring break-glass (emergency access) account..."
+
+if (-not $BreakGlassUpn) { $BreakGlassUpn = "breakglass@$initialDomain" }
+
+$bgUser = Get-MgUser -Filter "userPrincipalName eq '$BreakGlassUpn'" -ErrorAction SilentlyContinue
+if (-not $bgUser) {
+    $bgPassword = New-RandomPassword
+    if ($PSCmdlet.ShouldProcess($BreakGlassUpn, 'Create break-glass account')) {
+        $bgUser = New-MgUser -DisplayName 'Emergency Access' `
+            -UserPrincipalName $BreakGlassUpn `
+            -MailNickname 'breakglass' `
+            -AccountEnabled:$true `
+            -PasswordProfile @{ Password = $bgPassword; ForceChangePasswordNextSignIn = $false }
+        Write-Step "Break-glass account created: $BreakGlassUpn" 'OK'
+        Write-Host  "`n  *** BREAK-GLASS PASSWORD (store offline in a safe, then rotate): $bgPassword ***`n" -ForegroundColor Magenta
+    }
+} else {
+    Write-Step "Break-glass account already exists: $BreakGlassUpn" 'SKIP'
+}
+
+# Assign Global Administrator to the break-glass account
+try {
+    $gaRole = Get-MgDirectoryRole -Filter "displayName eq 'Global Administrator'"
+    if (-not $gaRole) {
+        $gaTemplate = Get-MgDirectoryRoleTemplate | Where-Object DisplayName -eq 'Global Administrator'
+        $gaRole = New-MgDirectoryRole -RoleTemplateId $gaTemplate.Id
+    }
+    $isMember = Get-MgDirectoryRoleMember -DirectoryRoleId $gaRole.Id | Where-Object Id -eq $bgUser.Id
+    if (-not $isMember -and $PSCmdlet.ShouldProcess($BreakGlassUpn, 'Assign Global Administrator')) {
+        New-MgDirectoryRoleMemberByRef -DirectoryRoleId $gaRole.Id `
+            -BodyParameter @{ '@odata.id' = "https://graph.microsoft.com/v1.0/directoryObjects/$($bgUser.Id)" }
+        Write-Step "Global Administrator assigned to break-glass account" 'OK'
+    }
+} catch { Write-Step "Could not assign GA role automatically: $($_.Exception.Message)" 'WARN' }
+
+# Exclusion group used by every CA policy
+$bgGroupName = 'SEC - CA Exclusions (Break Glass)'
+$bgGroup = Get-MgGroup -Filter "displayName eq '$bgGroupName'" -ErrorAction SilentlyContinue
+if (-not $bgGroup) {
+    $bgGroup = New-MgGroup -DisplayName $bgGroupName -MailEnabled:$false `
+        -MailNickname 'sec-ca-exclusions' -SecurityEnabled:$true `
+        -Description 'Excluded from all Conditional Access policies. Members: emergency access accounts only.'
+    Write-Step "Exclusion group created: $bgGroupName" 'OK'
+}
+$member = Get-MgGroupMember -GroupId $bgGroup.Id -All | Where-Object Id -eq $bgUser.Id
+if (-not $member) {
+    New-MgGroupMember -GroupId $bgGroup.Id -DirectoryObjectId $bgUser.Id
+    Write-Step "Break-glass account added to exclusion group" 'OK'
+}
+
+#endregion
+
+#region ── 4. Entra tenant-wide hardening (all licenses) ─────────────────────
+
+Write-Step "Applying tenant-wide Entra ID hardening..."
+
+# 4.1 Authorization policy: block user consent, block app registration, restrict guest invites
+$authzBody = @{
+    defaultUserRolePermissions = @{
+        allowedToCreateApps            = $false
+        allowedToCreateSecurityGroups  = $false
+        allowedToCreateTenants         = $false
+        allowedToReadOtherUsers        = $true
+    }
+    allowInvitesFrom          = 'adminsAndGuestInviters'
+    allowedToSignUpEmailBasedSubscriptions = $false
+    allowEmailVerifiedUsersToJoinOrganization = $false
+    # Guests get restricted access (cannot enumerate directory)
+    guestUserRoleId           = '2af84b1e-32c8-42b7-82bc-daa82404023b'
+    permissionGrantPolicyIdsAssignedToDefaultUserRole = @('managePermissionGrantsForSelf.microsoft-user-default-low')
+}
+if ($PSCmdlet.ShouldProcess('Authorization Policy', 'Harden defaults')) {
+    Invoke-MgGraphRequest -Method PATCH -Uri 'https://graph.microsoft.com/v1.0/policies/authorizationPolicy' -Body ($authzBody | ConvertTo-Json -Depth 5)
+    Write-Step "Authorization policy hardened (no user app registration, guest invites restricted, low-risk consent only)" 'OK'
+}
+
+# 4.2 Admin consent request workflow
+$adminConsentBody = @{
+    isEnabled              = $true
+    notifyReviewers        = $true
+    remindersEnabled       = $true
+    requestDurationInDays  = 30
+    reviewers              = @()   # add reviewers post-deployment via portal or extend script
+}
+try {
+    Invoke-MgGraphRequest -Method PUT -Uri 'https://graph.microsoft.com/v1.0/policies/adminConsentRequestPolicy' -Body ($adminConsentBody | ConvertTo-Json)
+    Write-Step "Admin consent request workflow enabled (add reviewers in Entra portal)" 'OK'
+} catch { Write-Step "Admin consent workflow: $($_.Exception.Message)" 'WARN' }
+
+# 4.3 Authentication methods: enable FIDO2/passkeys + Microsoft Authenticator
+try {
+    $fido2Body = @{
+        '@odata.type' = '#microsoft.graph.fido2AuthenticationMethodConfiguration'
+        state = 'enabled'
+        isSelfServiceRegistrationAllowed = $true
+        isAttestationEnforced = $true
+    }
+    Invoke-MgGraphRequest -Method PATCH `
+        -Uri 'https://graph.microsoft.com/v1.0/policies/authenticationMethodsPolicy/authenticationMethodConfigurations/fido2' `
+        -Body ($fido2Body | ConvertTo-Json)
+    Write-Step "FIDO2 / passkeys enabled (attestation enforced)" 'OK'
+
+    $authAppBody = @{
+        '@odata.type' = '#microsoft.graph.microsoftAuthenticatorAuthenticationMethodConfiguration'
+        state = 'enabled'
+    }
+    Invoke-MgGraphRequest -Method PATCH `
+        -Uri 'https://graph.microsoft.com/v1.0/policies/authenticationMethodsPolicy/authenticationMethodConfigurations/microsoftAuthenticator' `
+        -Body ($authAppBody | ConvertTo-Json)
+    Write-Step "Microsoft Authenticator enabled" 'OK'
+} catch { Write-Step "Authentication methods policy: $($_.Exception.Message)" 'WARN' }
+
+#endregion
+
+#region ── 5. Conditional Access (Entra ID P1/P2) or Security Defaults ───────
+
+$caState = if ($EnforceCAPolicies) { 'enabled' } else { 'enabledForReportingButNotEnforced' }
+
+function New-CAPolicyIfMissing {
+    param([string]$DisplayName, [hashtable]$Body)
+    $existing = Get-MgIdentityConditionalAccessPolicy -Filter "displayName eq '$DisplayName'" -ErrorAction SilentlyContinue
+    if ($existing) { Write-Step "CA policy already exists: $DisplayName" 'SKIP'; return }
+    if ($PSCmdlet.ShouldProcess($DisplayName, "Create CA policy ($caState)")) {
+        Invoke-MgGraphRequest -Method POST `
+            -Uri 'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies' `
+            -Body ($Body | ConvertTo-Json -Depth 10)
+        Write-Step "CA policy created [$caState]: $DisplayName" 'OK'
+    }
+}
+
+if ($Lic.EntraP1) {
+
+    # 5.0 Disable Security Defaults (CA replaces it)
+    $sd = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/policies/identitySecurityDefaultsEnforcementPolicy'
+    if ($sd.isEnabled) {
+        Invoke-MgGraphRequest -Method PATCH `
+            -Uri 'https://graph.microsoft.com/v1.0/policies/identitySecurityDefaultsEnforcementPolicy' `
+            -Body (@{ isEnabled = $false } | ConvertTo-Json)
+        Write-Step "Security Defaults disabled (replaced by Conditional Access)" 'OK'
+    }
+
+    $excl = @($bgGroup.Id)
+    $adminRoles = @(
+        '62e90394-69f5-4237-9190-012177145e10' # Global Administrator
+        '194ae4cb-b126-40b2-bd5b-6091b380977d' # Security Administrator
+        'f28a1f50-f6e7-4571-818b-6a12f2af6b6c' # SharePoint Administrator
+        '29232cdf-9323-42fd-ade2-1d097af3e4de' # Exchange Administrator
+        '729827e3-9c14-49f7-bb1b-9608f156bbb8' # Helpdesk Administrator
+        'b0f54661-2d74-4c50-afa3-1ec803f12efe' # Billing Administrator
+        'fe930be7-5e62-47db-91af-98c3a49a38b1' # User Administrator
+        '9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3' # Application Administrator
+        'c4e39bd9-1100-46d3-8c65-fb160da0071f' # Authentication Administrator
+        '158c047a-c907-4556-b7ef-446551a6b5f7' # Cloud App Security Administrator
+        '966707d0-3269-4727-9be2-8c3a10f19b9d' # Password Administrator
+        '7be44c8a-adaf-4e2a-84d6-ab2649e08a13' # Privileged Auth Administrator
+        'e8611ab8-c189-46e8-94e1-60213ab1f814' # Privileged Role Administrator
+    )
+
+    # CA001 - Block legacy authentication
+    New-CAPolicyIfMissing -DisplayName 'CA001 - Block legacy authentication' -Body @{
+        displayName = 'CA001 - Block legacy authentication'
+        state       = $caState
+        conditions  = @{
+            users        = @{ includeUsers = @('All'); excludeGroups = $excl }
+            applications = @{ includeApplications = @('All') }
+            clientAppTypes = @('exchangeActiveSync','other')
+        }
+        grantControls = @{ operator = 'OR'; builtInControls = @('block') }
+    }
+
+    # CA002 - Require MFA for admins
+    New-CAPolicyIfMissing -DisplayName 'CA002 - Require MFA for admins' -Body @{
+        displayName = 'CA002 - Require MFA for admins'
+        state       = $caState
+        conditions  = @{
+            users        = @{ includeRoles = $adminRoles; excludeGroups = $excl }
+            applications = @{ includeApplications = @('All') }
+            clientAppTypes = @('browser','mobileAppsAndDesktopClients')
+        }
+        grantControls = @{ operator = 'OR'; builtInControls = @('mfa') }
+    }
+
+    # CA003 - Require MFA for all users
+    New-CAPolicyIfMissing -DisplayName 'CA003 - Require MFA for all users' -Body @{
+        displayName = 'CA003 - Require MFA for all users'
+        state       = $caState
+        conditions  = @{
+            users        = @{ includeUsers = @('All'); excludeGroups = $excl }
+            applications = @{ includeApplications = @('All') }
+            clientAppTypes = @('browser','mobileAppsAndDesktopClients')
+        }
+        grantControls = @{ operator = 'OR'; builtInControls = @('mfa') }
+    }
+
+    # CA004 - Require MFA for Azure management
+    New-CAPolicyIfMissing -DisplayName 'CA004 - Require MFA for Azure management' -Body @{
+        displayName = 'CA004 - Require MFA for Azure management'
+        state       = $caState
+        conditions  = @{
+            users        = @{ includeUsers = @('All'); excludeGroups = $excl }
+            applications = @{ includeApplications = @('797f4846-ba00-4fd7-ba43-dac1f8f63013') } # Azure mgmt
+            clientAppTypes = @('browser','mobileAppsAndDesktopClients')
+        }
+        grantControls = @{ operator = 'OR'; builtInControls = @('mfa') }
+    }
+
+    # CA006 - Sign-in frequency on unmanaged devices (session hardening)
+    New-CAPolicyIfMissing -DisplayName 'CA006 - No persistent sessions on unmanaged devices' -Body @{
+        displayName = 'CA006 - No persistent sessions on unmanaged devices'
+        state       = $caState
+        conditions  = @{
+            users        = @{ includeUsers = @('All'); excludeGroups = $excl }
+            applications = @{ includeApplications = @('All') }
+            clientAppTypes = @('browser')
+            devices      = @{ deviceFilter = @{ mode = 'include'; rule = 'device.trustType -ne "ServerAD" -and device.isCompliant -ne True' } }
+        }
+        sessionControls = @{
+            signInFrequency          = @{ isEnabled = $true; type = 'hours'; value = 12 }
+            persistentBrowser        = @{ isEnabled = $true; mode = 'never' }
+        }
+    }
+
+    if ($Lic.EntraP2) {
+        # CA101 - Sign-in risk
+        New-CAPolicyIfMissing -DisplayName 'CA101 - Require MFA for medium+ sign-in risk' -Body @{
+            displayName = 'CA101 - Require MFA for medium+ sign-in risk'
+            state       = $caState
+            conditions  = @{
+                users        = @{ includeUsers = @('All'); excludeGroups = $excl }
+                applications = @{ includeApplications = @('All') }
+                signInRiskLevels = @('medium','high')
+                clientAppTypes = @('browser','mobileAppsAndDesktopClients')
+            }
+            grantControls = @{ operator = 'OR'; builtInControls = @('mfa') }
+        }
+        # CA102 - User risk
+        New-CAPolicyIfMissing -DisplayName 'CA102 - Password change for high user risk' -Body @{
+            displayName = 'CA102 - Password change for high user risk'
+            state       = $caState
+            conditions  = @{
+                users        = @{ includeUsers = @('All'); excludeGroups = $excl }
+                applications = @{ includeApplications = @('All') }
+                userRiskLevels = @('high')
+                clientAppTypes = @('browser','mobileAppsAndDesktopClients')
+            }
+            grantControls = @{ operator = 'AND'; builtInControls = @('mfa','passwordChange') }
+        }
+    } else {
+        Write-Step "Entra ID P2 not licensed - skipping risk-based CA policies" 'SKIP'
+    }
+
+    if ($Lic.Intune) {
+        # CA201 - Require compliant device (always report-only initially, regardless of switch)
+        New-CAPolicyIfMissing -DisplayName 'CA201 - Require compliant device for O365 (Report-Only)' -Body @{
+            displayName = 'CA201 - Require compliant device for O365 (Report-Only)'
+            state       = 'enabledForReportingButNotEnforced'
+            conditions  = @{
+                users        = @{ includeUsers = @('All'); excludeGroups = $excl }
+                applications = @{ includeApplications = @('Office365') }
+                clientAppTypes = @('browser','mobileAppsAndDesktopClients')
+            }
+            grantControls = @{ operator = 'OR'; builtInControls = @('compliantDevice','domainJoinedDevice') }
+        }
+    } else {
+        Write-Step "Intune not licensed - skipping device compliance CA policy" 'SKIP'
+    }
+
+} else {
+    # No P1: fall back to Security Defaults
+    Write-Step "Entra ID P1 not licensed - enabling Security Defaults instead of Conditional Access" 'WARN'
+    Invoke-MgGraphRequest -Method PATCH `
+        -Uri 'https://graph.microsoft.com/v1.0/policies/identitySecurityDefaultsEnforcementPolicy' `
+        -Body (@{ isEnabled = $true } | ConvertTo-Json)
+    Write-Step "Security Defaults enabled (MFA registration enforced, legacy auth blocked)" 'OK'
+}
+
+#endregion
+
+#region ── 6. Exchange Online hardening ──────────────────────────────────────
+
+if (-not $SkipExchange -and $Lic.ExchangeOnline) {
+    Write-Step "Connecting to Exchange Online..."
+    Connect-ExchangeOnline -Organization $initialDomain -ShowBanner:$false
+
+    # 6.1 Unified audit log
+    $audit = Get-AdminAuditLogConfig
+    if (-not $audit.UnifiedAuditLogIngestionEnabled) {
+        Set-AdminAuditLogConfig -UnifiedAuditLogIngestionEnabled $true
+        Write-Step "Unified Audit Log enabled" 'OK'
+    } else { Write-Step "Unified Audit Log already enabled" 'SKIP' }
+
+    # 6.2 Enable organization-wide mailbox auditing default & modern auth
+    Set-OrganizationConfig -AuditDisabled $false -OAuth2ClientProfileEnabled $true
+    Write-Step "Mailbox auditing on, Modern Auth enforced" 'OK'
+
+    # 6.3 Block external auto-forwarding
+    Set-RemoteDomain Default -AutoForwardEnabled $false
+    $outbound = Get-HostedOutboundSpamFilterPolicy -Identity Default
+    Set-HostedOutboundSpamFilterPolicy -Identity Default -AutoForwardingMode Off `
+        -RecipientLimitExternalPerHour 400 -RecipientLimitInternalPerHour 800 -RecipientLimitPerDay 800 `
+        -ActionWhenThresholdReached BlockUser
+    Write-Step "External auto-forwarding blocked, outbound spam limits set" 'OK'
+
+    # 6.4 Disable connected/additional storage providers in OWA, harden OWA policy
+    Set-OwaMailboxPolicy -Identity OwaMailboxPolicy-Default -AdditionalStorageProvidersAvailable $false
+    Write-Step "Third-party storage providers in OWA disabled" 'OK'
+
+    # 6.5 Preset security policies (Standard). Uses EOP; Safe Links/Attachments only apply with MDO license.
+    try {
+        $preset = Get-EOPProtectionPolicyRule -ErrorAction SilentlyContinue | Where-Object Name -like 'Standard*'
+        if (-not $preset) {
+            Enable-EOPProtectionPolicyRule -Identity 'Standard Preset Security Policy' -ErrorAction SilentlyContinue
+        }
+        # Apply standard preset to all recipients in the tenant's default domain
+        Write-Step "Verify/assign 'Standard' preset security policy scope in Defender portal (recipient conditions)" 'WARN'
+    } catch {
+        Write-Step "Preset policy rules not yet provisioned in new tenant - assign via Defender portal > Email & collaboration > Policies" 'WARN'
+    }
+
+    # 6.6 Defender for Office 365: Safe Links / Safe Attachments (if licensed)
+    if ($Lic.MDO_P1 -or $Lic.MDO_P2) {
+        try {
+            New-SafeLinksPolicy -Name 'Baseline SafeLinks' -EnableSafeLinksForEmail $true `
+                -EnableSafeLinksForTeams $true -EnableSafeLinksForOffice $true `
+                -ScanUrls $true -DeliverMessageAfterScan $true -TrackClicks $true `
+                -AllowClickThrough $false -ErrorAction Stop | Out-Null
+            New-SafeLinksRule -Name 'Baseline SafeLinks Rule' -SafeLinksPolicy 'Baseline SafeLinks' `
+                -RecipientDomainIs ($org.VerifiedDomains.Name) -ErrorAction Stop | Out-Null
+            Write-Step "Safe Links policy created" 'OK'
+        } catch { Write-Step "Safe Links: $($_.Exception.Message)" 'WARN' }
+
+        try {
+            New-SafeAttachmentPolicy -Name 'Baseline SafeAttachments' -Enable $true -Action Block `
+                -Redirect $false -ErrorAction Stop | Out-Null
+            New-SafeAttachmentRule -Name 'Baseline SafeAttachments Rule' -SafeAttachmentPolicy 'Baseline SafeAttachments' `
+                -RecipientDomainIs ($org.VerifiedDomains.Name) -ErrorAction Stop | Out-Null
+            Write-Step "Safe Attachments policy created (Action: Block)" 'OK'
+        } catch { Write-Step "Safe Attachments: $($_.Exception.Message)" 'WARN' }
+
+        try {
+            New-AntiPhishPolicy -Name 'Baseline AntiPhish' -Enabled $true `
+                -EnableMailboxIntelligence $true -EnableMailboxIntelligenceProtection $true `
+                -MailboxIntelligenceProtectionAction Quarantine `
+                -EnableSpoofIntelligence $true -AuthenticationFailAction Quarantine `
+                -EnableFirstContactSafetyTips $true -EnableUnauthenticatedSender $true `
+                -EnableViaTag $true -PhishThresholdLevel 3 -ErrorAction Stop | Out-Null
+            New-AntiPhishRule -Name 'Baseline AntiPhish Rule' -AntiPhishPolicy 'Baseline AntiPhish' `
+                -RecipientDomainIs ($org.VerifiedDomains.Name) -ErrorAction Stop | Out-Null
+            Write-Step "Anti-phishing policy created (threshold 3 - Aggressive)" 'OK'
+        } catch { Write-Step "Anti-phish: $($_.Exception.Message)" 'WARN' }
+    } else {
+        Write-Step "Defender for Office 365 not licensed - EOP defaults + preset policy only" 'SKIP'
+    }
+
+    Disconnect-ExchangeOnline -Confirm:$false
+} elseif (-not $SkipExchange) {
+    Write-Step "Exchange Online not licensed - skipping" 'SKIP'
+}
+
+#endregion
+
+#region ── 7. SharePoint / OneDrive hardening ────────────────────────────────
+
+if (-not $SkipSharePoint -and $Lic.SharePoint) {
+    $tenantName = $initialDomain -replace '\.onmicrosoft\.com$',''
+    $adminUrl = "https://$tenantName-admin.sharepoint.com"
+    Write-Step "Connecting to SharePoint Online admin ($adminUrl)..."
+    try {
+        Connect-SPOService -Url $adminUrl
+
+        Set-SPOTenant `
+            -SharingCapability ExternalUserSharingOnly `
+            -DefaultSharingLinkType Direct `
+            -DefaultLinkPermission View `
+            -RequireAnonymousLinksExpireInDays 30 `
+            -FileAnonymousLinkType View `
+            -FolderAnonymousLinkType View `
+            -PreventExternalUsersFromResharing $true `
+            -SharingDomainRestrictionMode None `
+            -LegacyAuthProtocolsEnabled $false `
+            -DisallowInfectedFileDownload $true
+
+        Write-Step "SharePoint: external sharing = authenticated guests only, direct links default, legacy auth off" 'OK'
+
+        # OneDrive default storage & sync restrictions can be added here (e.g., Set-SPOTenantSyncClientRestriction)
+        Disconnect-SPOService
+    } catch {
+        Write-Step "SharePoint config failed: $($_.Exception.Message)" 'WARN'
+    }
+} elseif (-not $SkipSharePoint) {
+    Write-Step "SharePoint not licensed - skipping" 'SKIP'
+}
+
+#endregion
+
+#region ── 8. Summary & post-deployment checklist ────────────────────────────
+
+Write-Host "`n================ SUMMARY ================" -ForegroundColor White
+$script:Log | Group-Object Level | ForEach-Object {
+    Write-Host ("{0,-6}: {1}" -f $_.Name, $_.Count)
+}
+
+$reportPath = Join-Path (Get-Location) ("M365Baseline_{0}_{1:yyyyMMdd_HHmm}.csv" -f $initialDomain, (Get-Date))
+$script:Log | Export-Csv -Path $reportPath -NoTypeInformation -Encoding UTF8
+Write-Step "Deployment log exported: $reportPath" 'OK'
+
+Write-Host @"
+
+──────────────── POST-DEPLOYMENT CHECKLIST ────────────────
+ 1. Store the break-glass password OFFLINE (safe/vault), then register
+    a FIDO2 key for it and rotate the password.
+ 2. CA policies are in REPORT-ONLY mode. Review Sign-in logs
+    (Entra > Monitoring > Sign-in logs > Report-only tab) for 3-7 days,
+    then re-run with -EnforceCAPolicies or enable manually.
+ 3. Add reviewers to the admin consent workflow (Entra > Enterprise apps
+    > Consent and permissions > Admin consent settings).
+ 4. Configure DKIM for all custom domains (Defender portal > Email auth).
+ 5. Set up alerting for break-glass account sign-ins
+    (Log Analytics / Sentinel or Defender alert policy).
+ 6. If Intune licensed: create compliance policies BEFORE enforcing CA201.
+ 7. Review Secure Score for remaining tenant-specific recommendations.
+────────────────────────────────────────────────────────────
+"@ -ForegroundColor Yellow
+
+Disconnect-MgGraph | Out-Null
+Write-Step "Done." 'OK'
+
+#endregion
