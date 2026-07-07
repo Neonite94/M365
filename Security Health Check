@@ -1,0 +1,389 @@
+<#
+.SYNOPSIS
+    M365 Tenant Security Health Check - Read-Only Reporting
+.DESCRIPTION
+    Connects to Microsoft Graph with read-only scopes and generates an HTML report covering:
+      - Microsoft Secure Score (current, max, percentage, top improvement actions)
+      - Active security alerts / incidents (Defender XDR via Graph Security API)
+      - Service health overview (M365 workloads)
+      - Identity risk (risky users, risk detections) - requires Entra ID P2
+      - Conditional Access policy inventory
+      - MFA / authentication method registration summary
+      - Privileged role member counts
+
+    NO write operations are performed. All scopes requested are *.Read.All.
+
+.REQUIREMENTS
+    - PowerShell 7.x recommended (works on 5.1)
+    - Microsoft.Graph modules (script installs missing submodules for current user)
+    - Account with at least Global Reader + Security Reader roles
+    - Admin consent for the read scopes on first run
+
+.MULTI-TENANT USAGE
+    The script is tenant-neutral. On every run it:
+      1. Disconnects any cached Graph session
+      2. Forces a fresh interactive sign-in with account picker
+      3. Shows the connected tenant and asks for confirmation before collecting data
+      4. Keeps the token in-process only (nothing persisted between runs)
+
+.EXAMPLE
+    .\Invoke-M365SecurityHealthCheck.ps1
+    # Prompts for sign-in, you pick the tenant account interactively
+
+.EXAMPLE
+    .\Invoke-M365SecurityHealthCheck.ps1 -TenantId "contoso.onmicrosoft.com"
+    # Pins the sign-in to a specific tenant (ID or domain)
+
+.EXAMPLE
+    .\Invoke-M365SecurityHealthCheck.ps1 -OutputPath "C:\Reports" -TopImprovementActions 15 -Force
+    # -Force skips the tenant confirmation prompt (for scripted batch runs)
+#>
+
+[CmdletBinding()]
+param(
+    [string]$TenantId,                              # Optional: tenant ID or domain to pin the sign-in
+    [string]$OutputPath = (Get-Location).Path,
+    [int]$TopImprovementActions = 10,
+    [switch]$SkipModuleCheck,
+    [switch]$Force                                  # Skip tenant confirmation prompt
+)
+
+$ErrorActionPreference = 'Stop'
+$reportDate = Get-Date -Format 'yyyy-MM-dd_HHmm'
+
+#region --- Module check ---
+$requiredModules = @(
+    'Microsoft.Graph.Authentication',
+    'Microsoft.Graph.Security',
+    'Microsoft.Graph.Identity.SignIns',
+    'Microsoft.Graph.Identity.DirectoryManagement',
+    'Microsoft.Graph.Reports',
+    'Microsoft.Graph.Devices.ServiceAnnouncement'
+)
+
+if (-not $SkipModuleCheck) {
+    foreach ($mod in $requiredModules) {
+        if (-not (Get-Module -ListAvailable -Name $mod)) {
+            Write-Host "Installing missing module: $mod" -ForegroundColor Yellow
+            Install-Module $mod -Scope CurrentUser -Force -AllowClobber
+        }
+    }
+}
+#endregion
+
+#region --- Connect (read-only scopes) ---
+$scopes = @(
+    'SecurityEvents.Read.All',        # Secure Score, alerts
+    'SecurityAlert.Read.All',         # Defender XDR alerts v2
+    'SecurityIncident.Read.All',      # Incidents
+    'IdentityRiskyUser.Read.All',     # Risky users (P2)
+    'IdentityRiskEvent.Read.All',     # Risk detections (P2)
+    'Policy.Read.All',                # Conditional Access
+    'Reports.Read.All',               # MFA registration report
+    'Directory.Read.All',             # Org info, roles
+    'ServiceHealth.Read.All',         # Service health
+    'RoleManagement.Read.Directory'   # Role members
+)
+
+# --- Tenant-neutral connection: always start from a clean session ---
+# Drop any cached Graph context so the script never silently reuses a previous tenant's token
+if (Get-MgContext) {
+    Write-Host "Clearing existing Graph session..." -ForegroundColor Yellow
+    Disconnect-MgGraph | Out-Null
+}
+
+Write-Host "Connecting to Microsoft Graph (read-only scopes) - please sign in..." -ForegroundColor Cyan
+
+# -ContextScope Process : token lives only in this PowerShell process, nothing persisted to disk
+# -TenantId (optional)  : pins sign-in to a specific tenant; otherwise the account picker decides
+$connectParams = @{
+    Scopes       = $scopes
+    ContextScope = 'Process'
+    NoWelcome    = $true
+}
+if ($TenantId) { $connectParams.TenantId = $TenantId }
+
+Connect-MgGraph @connectParams
+
+$ctx = Get-MgContext
+$org = Get-MgOrganization
+$tenantName = $org.DisplayName
+$defaultDomain = ($org.VerifiedDomains | Where-Object IsDefault).Name
+
+Write-Host ""
+Write-Host "================================================" -ForegroundColor Green
+Write-Host " Connected tenant : $tenantName" -ForegroundColor Green
+Write-Host " Default domain   : $defaultDomain" -ForegroundColor Green
+Write-Host " Tenant ID        : $($ctx.TenantId)" -ForegroundColor Green
+Write-Host " Signed in as     : $($ctx.Account)" -ForegroundColor Green
+Write-Host "================================================" -ForegroundColor Green
+
+# Safety check for multi-tenant work: confirm before touching the wrong customer
+if (-not $Force) {
+    $confirm = Read-Host "`nRun the security health check against THIS tenant? (Y/N)"
+    if ($confirm -notmatch '^[YyJj]') {
+        Write-Host "Aborted by user. Disconnecting..." -ForegroundColor Yellow
+        Disconnect-MgGraph | Out-Null
+        return
+    }
+}
+#endregion
+
+$results = [ordered]@{}
+$warnings = New-Object System.Collections.Generic.List[string]
+
+function Invoke-Safely {
+    param([string]$Name, [scriptblock]$Block)
+    try { & $Block }
+    catch {
+        $script:warnings.Add("$Name failed: $($_.Exception.Message)")
+        Write-Warning "$Name failed: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+#region --- 1. Secure Score ---
+Write-Host "`n[1/7] Retrieving Secure Score..." -ForegroundColor Cyan
+$secureScore = Invoke-Safely 'SecureScore' {
+    Get-MgSecuritySecureScore -Top 1 | Select-Object -First 1
+}
+
+$scorePct = $null
+if ($secureScore) {
+    $scorePct = [math]::Round(($secureScore.CurrentScore / $secureScore.MaxScore) * 100, 1)
+    $results.SecureScore = [PSCustomObject]@{
+        CurrentScore = [math]::Round($secureScore.CurrentScore, 2)
+        MaxScore     = $secureScore.MaxScore
+        Percentage   = $scorePct
+        CreatedDate  = $secureScore.CreatedDateTime
+    }
+    # Comparison to similar-sized organizations
+    $avgComparative = $secureScore.AverageComparativeScores |
+        Where-Object { $_.Basis -eq 'TotalSeats' } | Select-Object -First 1
+    if ($avgComparative) {
+        $results.SecureScoreComparison = [math]::Round($avgComparative.AverageScore, 1)
+    }
+}
+
+# Top improvement actions (not yet fully implemented controls)
+$improvementActions = Invoke-Safely 'ImprovementActions' {
+    $profiles = Get-MgSecuritySecureScoreControlProfile -All
+    $states = @{}
+    if ($secureScore) {
+        foreach ($cs in $secureScore.ControlScores) {
+            $states[$cs.ControlName] = $cs
+        }
+    }
+    $profiles | ForEach-Object {
+        $cs = $states[$_.Id]
+        $scoreGap = if ($cs) { $_.MaxScore - [double]$cs.AdditionalProperties['score'] } else { $_.MaxScore }
+        [PSCustomObject]@{
+            Title       = $_.Title
+            Category    = $_.ControlCategory
+            MaxScore    = $_.MaxScore
+            ScoreGap    = [math]::Round($scoreGap, 1)
+            Rank        = $_.Rank
+            Service     = $_.Service
+        }
+    } | Where-Object { $_.ScoreGap -gt 0 } |
+        Sort-Object ScoreGap -Descending |
+        Select-Object -First $TopImprovementActions
+}
+$results.ImprovementActions = $improvementActions
+#endregion
+
+#region --- 2. Security alerts & incidents ---
+Write-Host "[2/7] Retrieving active security alerts and incidents..." -ForegroundColor Cyan
+$alerts = Invoke-Safely 'Alerts' {
+    Get-MgSecurityAlertV2 -Filter "status ne 'resolved'" -Top 100 |
+        Select-Object Title, Severity, Status, Category, CreatedDateTime, DetectionSource
+}
+$results.Alerts = $alerts
+$results.AlertSummary = if ($alerts) {
+    $alerts | Group-Object Severity | ForEach-Object {
+        [PSCustomObject]@{ Severity = $_.Name; Count = $_.Count }
+    }
+} else { @() }
+
+$incidents = Invoke-Safely 'Incidents' {
+    Get-MgSecurityIncident -Filter "status eq 'active'" -Top 50 |
+        Select-Object DisplayName, Severity, Status, CreatedDateTime, Classification
+}
+$results.Incidents = $incidents
+#endregion
+
+#region --- 3. Service health ---
+Write-Host "[3/7] Retrieving service health overview..." -ForegroundColor Cyan
+$serviceHealth = Invoke-Safely 'ServiceHealth' {
+    Get-MgServiceAnnouncementHealthOverview -All |
+        Select-Object Service, Status
+}
+$results.ServiceHealth = $serviceHealth
+#endregion
+
+#region --- 4. Identity risk (requires Entra ID P2) ---
+Write-Host "[4/7] Retrieving identity risk data (requires Entra ID P2)..." -ForegroundColor Cyan
+$riskyUsers = Invoke-Safely 'RiskyUsers' {
+    Get-MgRiskyUser -Filter "riskState eq 'atRisk'" -Top 100 |
+        Select-Object UserDisplayName, UserPrincipalName, RiskLevel, RiskState, RiskLastUpdatedDateTime
+}
+$results.RiskyUsers = $riskyUsers
+#endregion
+
+#region --- 5. Conditional Access inventory ---
+Write-Host "[5/7] Retrieving Conditional Access policies..." -ForegroundColor Cyan
+$caPolicies = Invoke-Safely 'ConditionalAccess' {
+    Get-MgIdentityConditionalAccessPolicy -All | ForEach-Object {
+        [PSCustomObject]@{
+            DisplayName  = $_.DisplayName
+            State        = $_.State
+            CreatedDate  = $_.CreatedDateTime
+            ModifiedDate = $_.ModifiedDateTime
+            GrantControls = ($_.GrantControls.BuiltInControls -join ', ')
+        }
+    }
+}
+$results.CAPolicies = $caPolicies
+$results.CASummary = if ($caPolicies) {
+    [PSCustomObject]@{
+        Total          = $caPolicies.Count
+        Enabled        = ($caPolicies | Where-Object State -eq 'enabled').Count
+        ReportOnly     = ($caPolicies | Where-Object State -eq 'enabledForReportingButNotEnforced').Count
+        Disabled       = ($caPolicies | Where-Object State -eq 'disabled').Count
+    }
+} else { $null }
+#endregion
+
+#region --- 6. MFA registration ---
+Write-Host "[6/7] Retrieving authentication method registration report..." -ForegroundColor Cyan
+$mfaReport = Invoke-Safely 'MFARegistration' {
+    $regDetails = Get-MgReportAuthenticationMethodUserRegistrationDetail -All
+    $total = $regDetails.Count
+    [PSCustomObject]@{
+        TotalUsers            = $total
+        MFARegistered         = ($regDetails | Where-Object IsMfaRegistered).Count
+        MFACapable            = ($regDetails | Where-Object IsMfaCapable).Count
+        PasswordlessCapable   = ($regDetails | Where-Object IsPasswordlessCapable).Count
+        SSPRRegistered        = ($regDetails | Where-Object IsSsprRegistered).Count
+        MFARegisteredPct      = if ($total) { [math]::Round((($regDetails | Where-Object IsMfaRegistered).Count / $total) * 100, 1) } else { 0 }
+        PasswordlessPct       = if ($total) { [math]::Round((($regDetails | Where-Object IsPasswordlessCapable).Count / $total) * 100, 1) } else { 0 }
+    }
+}
+$results.MFA = $mfaReport
+#endregion
+
+#region --- 7. Privileged roles ---
+Write-Host "[7/7] Retrieving privileged role membership..." -ForegroundColor Cyan
+$privRoles = Invoke-Safely 'PrivilegedRoles' {
+    $watchRoles = @('Global Administrator','Privileged Role Administrator','Security Administrator',
+                    'Exchange Administrator','SharePoint Administrator','User Administrator',
+                    'Conditional Access Administrator','Application Administrator')
+    Get-MgDirectoryRole -All | Where-Object { $watchRoles -contains $_.DisplayName } | ForEach-Object {
+        $members = Get-MgDirectoryRoleMember -DirectoryRoleId $_.Id -All
+        [PSCustomObject]@{
+            Role        = $_.DisplayName
+            MemberCount = $members.Count
+        }
+    } | Sort-Object MemberCount -Descending
+}
+$results.PrivilegedRoles = $privRoles
+#endregion
+
+#region --- HTML report ---
+Write-Host "`nGenerating HTML report..." -ForegroundColor Cyan
+
+function ConvertTo-HtmlTable {
+    param($Data, [string]$EmptyMessage = 'No data available (check license/permissions).')
+    if (-not $Data -or @($Data).Count -eq 0) { return "<p class='empty'>$EmptyMessage</p>" }
+    ($Data | ConvertTo-Html -Fragment) -join "`n"
+}
+
+$scoreClass = if ($scorePct -ge 70) { 'good' } elseif ($scorePct -ge 50) { 'warn' } else { 'bad' }
+$highAlerts = @($alerts | Where-Object Severity -eq 'high').Count
+$mfaPct = if ($mfaReport) { $mfaReport.MFARegisteredPct } else { 'N/A' }
+
+$html = @"
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>M365 Security Health Check - $tenantName</title>
+<style>
+    body { font-family: 'Segoe UI', Arial, sans-serif; margin: 30px; color: #222; background: #f5f6f8; }
+    h1 { color: #1a3c6e; border-bottom: 3px solid #1a3c6e; padding-bottom: 8px; }
+    h2 { color: #1a3c6e; margin-top: 36px; }
+    .meta { color: #666; font-size: 0.9em; }
+    .cards { display: flex; gap: 16px; flex-wrap: wrap; margin: 24px 0; }
+    .card { background: #fff; border-radius: 8px; padding: 18px 24px; box-shadow: 0 1px 4px rgba(0,0,0,.12); min-width: 180px; }
+    .card .value { font-size: 2em; font-weight: 600; }
+    .card .label { color: #666; font-size: .85em; margin-top: 4px; }
+    .good .value { color: #1e7e34; } .warn .value { color: #cc8800; } .bad .value { color: #c0392b; }
+    table { border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.1); }
+    th { background: #1a3c6e; color: #fff; padding: 8px 12px; text-align: left; font-size: .9em; }
+    td { padding: 7px 12px; border-bottom: 1px solid #e2e5ea; font-size: .88em; }
+    tr:hover td { background: #f0f4fa; }
+    .empty { color: #888; font-style: italic; }
+    .warnings { background: #fff3cd; border: 1px solid #ffe08a; border-radius: 6px; padding: 12px 16px; margin-top: 24px; font-size: .88em; }
+    footer { margin-top: 40px; color: #999; font-size: .8em; }
+</style>
+</head>
+<body>
+<h1>M365 Tenant Security Health Check</h1>
+<p class="meta">Tenant: <strong>$tenantName</strong> ($($ctx.TenantId))<br>
+Generated: $(Get-Date -Format 'dd.MM.yyyy HH:mm') &middot; Read-only report &middot; No changes were made to the tenant.</p>
+
+<div class="cards">
+    <div class="card $scoreClass"><div class="value">$scorePct%</div><div class="label">Secure Score ($($results.SecureScore.CurrentScore) / $($results.SecureScore.MaxScore))</div></div>
+    <div class="card $(if ($highAlerts -gt 0) {'bad'} else {'good'})"><div class="value">$(@($alerts).Count)</div><div class="label">Active Alerts ($highAlerts high severity)</div></div>
+    <div class="card $(if (@($riskyUsers).Count -gt 0) {'bad'} else {'good'})"><div class="value">$(@($riskyUsers).Count)</div><div class="label">At-Risk Users</div></div>
+    <div class="card $(if ($mfaReport -and $mfaReport.MFARegisteredPct -ge 90) {'good'} elseif ($mfaReport -and $mfaReport.MFARegisteredPct -ge 70) {'warn'} else {'bad'})"><div class="value">$mfaPct%</div><div class="label">MFA Registered</div></div>
+    <div class="card"><div class="value">$(if ($results.CASummary) { $results.CASummary.Enabled } else { 'N/A' })</div><div class="label">Enabled CA Policies</div></div>
+</div>
+
+<h2>1. Secure Score - Top Improvement Actions</h2>
+$(ConvertTo-HtmlTable $results.ImprovementActions)
+$(if ($results.SecureScoreComparison) { "<p class='meta'>Average score of similar-sized organizations: $($results.SecureScoreComparison)</p>" })
+
+<h2>2. Active Security Alerts</h2>
+$(ConvertTo-HtmlTable $results.AlertSummary 'No active alerts.')
+$(ConvertTo-HtmlTable $results.Alerts 'No active alerts.')
+
+<h2>3. Active Incidents</h2>
+$(ConvertTo-HtmlTable $results.Incidents 'No active incidents.')
+
+<h2>4. Service Health Overview</h2>
+$(ConvertTo-HtmlTable $results.ServiceHealth)
+
+<h2>5. At-Risk Users (Entra ID Protection)</h2>
+$(ConvertTo-HtmlTable $results.RiskyUsers 'No at-risk users, or Entra ID P2 not licensed.')
+
+<h2>6. Conditional Access Policies</h2>
+$(ConvertTo-HtmlTable $results.CAPolicies)
+
+<h2>7. MFA / Authentication Method Registration</h2>
+$(ConvertTo-HtmlTable $results.MFA)
+
+<h2>8. Privileged Role Membership</h2>
+$(ConvertTo-HtmlTable $results.PrivilegedRoles)
+
+$(if ($warnings.Count -gt 0) {
+    "<div class='warnings'><strong>Data collection warnings:</strong><ul>" +
+    (($warnings | ForEach-Object { "<li>$_</li>" }) -join '') + "</ul></div>"
+})
+
+<footer>Generated by Invoke-M365SecurityHealthCheck.ps1 &middot; Microsoft Graph PowerShell SDK &middot; Read-only scopes</footer>
+</body>
+</html>
+"@
+
+# Tenant name in the filename keeps reports from multiple customers clearly separated
+$safeTenantName = ($tenantName -replace '[^\w\-]', '_')
+$reportFile = Join-Path $OutputPath "M365-SecurityHealthCheck_${safeTenantName}_$reportDate.html"
+$html | Out-File -FilePath $reportFile -Encoding utf8
+
+Write-Host "`nReport saved to: $reportFile" -ForegroundColor Green
+Write-Host "Disconnecting from Microsoft Graph..." -ForegroundColor Cyan
+Disconnect-MgGraph | Out-Null
+
+# Open the report (Windows)
+if ($IsWindows -or $env:OS -match 'Windows') { Invoke-Item $reportFile }
