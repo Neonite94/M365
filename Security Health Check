@@ -45,6 +45,7 @@ param(
     [string]$OutputPath = (Get-Location).Path,
     [int]$TopImprovementActions = 10,
     [switch]$SkipModuleCheck,
+    [switch]$DeviceCode,                            # Force device code sign-in (browser on any device)
     [switch]$Force                                  # Skip tenant confirmation prompt
 )
 
@@ -86,10 +87,18 @@ $scopes = @(
 )
 
 # --- Tenant-neutral connection: always start from a clean session ---
-# Drop any cached Graph context so the script never silently reuses a previous tenant's token
+# 1) Drop any cached Graph context so the script never silently reuses a previous tenant's token
 if (Get-MgContext) {
     Write-Host "Clearing existing Graph session..." -ForegroundColor Yellow
     Disconnect-MgGraph | Out-Null
+}
+
+# 2) Purge the on-disk MSAL token cache. Without this, Connect-MgGraph can silently
+#    reuse a valid cached token from a previous tenant and never show a sign-in prompt.
+$graphCachePath = Join-Path $env:USERPROFILE '.graph'
+if (Test-Path $graphCachePath) {
+    Write-Host "Purging Graph token cache ($graphCachePath) to force a fresh sign-in..." -ForegroundColor Yellow
+    Remove-Item $graphCachePath -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host "Connecting to Microsoft Graph (read-only scopes) - please sign in..." -ForegroundColor Cyan
@@ -103,7 +112,37 @@ $connectParams = @{
 }
 if ($TenantId) { $connectParams.TenantId = $TenantId }
 
-Connect-MgGraph @connectParams
+# Workaround: disable the Windows Web Account Manager (WAM) broker so authentication
+# opens a normal browser window instead. WAM frequently fails in elevated consoles.
+try { Set-MgGraphOption -EnableLoginByWAM $false -ErrorAction SilentlyContinue } catch {}
+
+if ($DeviceCode) {
+    # Device code flow: sign in from any browser/device using the code shown in the console.
+    # AADSTS70011: device code auth cannot use the /common endpoint - a tenant must be specified.
+    if (-not $TenantId) {
+        $TenantId = Read-Host "Device code flow requires a target tenant. Enter tenant ID or domain (e.g. customer.onmicrosoft.com)"
+        $connectParams.TenantId = $TenantId
+    }
+    $connectParams.UseDeviceCode = $true
+    Connect-MgGraph @connectParams
+}
+else {
+    try {
+        Connect-MgGraph @connectParams
+    }
+    catch {
+        # Interactive browser auth failed (common with WAM/elevated sessions) -> device code fallback
+        Write-Warning "Interactive sign-in failed: $($_.Exception.Message)"
+        Write-Host "Falling back to device code flow..." -ForegroundColor Yellow
+        if (-not $TenantId) {
+            $TenantId = Read-Host "Device code flow requires a target tenant. Enter tenant ID or domain (e.g. customer.onmicrosoft.com)"
+            $connectParams.TenantId = $TenantId
+        }
+        Write-Host "A code will be shown below - open the URL in ANY browser and enter it." -ForegroundColor Yellow
+        $connectParams.UseDeviceCode = $true
+        Connect-MgGraph @connectParams
+    }
+}
 
 $ctx = Get-MgContext
 $org = Get-MgOrganization
