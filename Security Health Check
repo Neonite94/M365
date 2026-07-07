@@ -42,7 +42,7 @@
 [CmdletBinding()]
 param(
     [string]$TenantId,                              # Optional: tenant ID or domain to pin the sign-in
-    [string]$OutputPath = (Get-Location).Path,
+    [string]$OutputPath = 'C:\temp',                # Report destination (created if it does not exist)
     [int]$TopImprovementActions = 10,
     [switch]$SkipModuleCheck,
     [switch]$DeviceCode,                            # Force device code sign-in (browser on any device)
@@ -51,6 +51,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $reportDate = Get-Date -Format 'yyyy-MM-dd_HHmm'
+
+# Ensure the report output folder exists (create it if missing)
+if (-not (Test-Path $OutputPath)) {
+    Write-Host "Output folder '$OutputPath' does not exist - creating it..." -ForegroundColor Yellow
+    New-Item -Path $OutputPath -ItemType Directory -Force | Out-Null
+}
 
 #region --- Module check ---
 $requiredModules = @(
