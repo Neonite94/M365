@@ -1,0 +1,73 @@
+<#
+.SYNOPSIS
+    Enables DKIM signing for a domain in Exchange Online and reports the DNS CNAME records to publish.
+
+.DESCRIPTION
+    Enabling DKIM lets Exchange Online cryptographically sign outbound mail for the given domain,
+    which helps it pass DMARC alignment and reduces the chance of being marked as spam - especially
+    useful for domains that also send through relay connectors (e.g. scan-to-email devices) where
+    SPF alone may not be sufficient.
+
+    This script:
+      1. Creates (or reuses) a DKIM signing configuration for the domain, initially disabled.
+      2. Prints the two CNAME records you must publish in your public DNS.
+      3. Optionally enables signing immediately (-AutoEnable), which will fail/warn if the CNAMEs
+         haven't propagated yet - safer to publish the records first, wait, then enable separately.
+
+.PARAMETER DomainName
+    The accepted domain to enable DKIM signing for, e.g. "contoso.com".
+
+.PARAMETER AutoEnable
+    If specified, attempts to enable signing immediately after creating the config. Only use this
+    if you've already published the CNAME records and given DNS time to propagate.
+
+.EXAMPLE
+    .\Enable-DomainDkimSigning.ps1 -DomainName "contoso.com"
+    Creates the DKIM config and prints the CNAME records to publish. Run
+    Set-DkimSigningConfig -Identity contoso.com -Enabled $true manually once DNS has propagated.
+
+.EXAMPLE
+    .\Enable-DomainDkimSigning.ps1 -DomainName "contoso.com" -AutoEnable
+#>
+
+[CmdletBinding(SupportsShouldProcess)]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$DomainName,
+
+    [switch]$AutoEnable
+)
+
+try {
+    $null = Get-ConnectionInformation -ErrorAction Stop
+}
+catch {
+    throw "No active Exchange Online PowerShell session found. Run Connect-ExchangeOnline first."
+}
+
+$config = Get-DkimSigningConfig -Identity $DomainName -ErrorAction SilentlyContinue
+
+if (-not $config) {
+    if ($PSCmdlet.ShouldProcess($DomainName, "Create DKIM signing configuration (disabled)")) {
+        $config = New-DkimSigningConfig -DomainName $DomainName -Enabled $false
+    }
+}
+else {
+    Write-Host "DKIM signing configuration for '$DomainName' already exists." -ForegroundColor Yellow
+}
+
+Write-Host "`nPublish these CNAME records in your public DNS for $DomainName :" -ForegroundColor Cyan
+Write-Host "  selector1._domainkey.$DomainName  CNAME  $($config.Selector1CNAME)"
+Write-Host "  selector2._domainkey.$DomainName  CNAME  $($config.Selector2CNAME)"
+
+if ($AutoEnable) {
+    Write-Warning "Attempting to enable DKIM signing now - this will only succeed if the CNAME records above have already propagated."
+    if ($PSCmdlet.ShouldProcess($DomainName, "Enable DKIM signing")) {
+        Set-DkimSigningConfig -Identity $DomainName -Enabled $true
+        Write-Host "DKIM signing enabled for $DomainName." -ForegroundColor Green
+    }
+}
+else {
+    Write-Host "`nOnce the CNAME records above have propagated, run:" -ForegroundColor Cyan
+    Write-Host "  Set-DkimSigningConfig -Identity $DomainName -Enabled `$true"
+}
