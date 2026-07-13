@@ -1,0 +1,76 @@
+<#
+.SYNOPSIS
+    Creates a mail flow (transport) rule that bypasses spam filtering for mail relayed from a trusted device IP.
+
+.DESCRIPTION
+    Exchange Online's Spoof Intelligence and anti-spam filtering can flag mail sent "as" your
+    own domain (e.g. from a scan-to-email device using an @yourdomain.com sender) if it arrives
+    through an anonymous relay connector rather than a normal authenticated mailbox. This can
+    cause legitimate scans to land in Junk Email, especially for internal recipients.
+
+    This script creates a narrowly-scoped transport rule that sets the Spam Confidence Level
+    (SCL) to -1 (verified non-spam) ONLY for mail from the specified sender IP address(es),
+    optionally further restricted to a specific From address.
+
+    Keep the scope as narrow as possible: this rule fully bypasses spam filtering for anything
+    it matches, so it should only cover a small, trusted, IP-restricted source such as a relay
+    connector you control (see New-ScannerInboundConnector.ps1).
+
+.PARAMETER RuleName
+    Name of the transport rule to create. Defaults to "Bypass spam filtering - Scanner relay".
+
+.PARAMETER SenderIPAddress
+    One or more IP addresses/ranges to match on. Should match the SenderIPAddress used on the
+    corresponding Inbound Connector.
+
+.PARAMETER SenderAddress
+    Optional. Restrict the rule further to a specific From address (e.g. scanner@yourdomain.com)
+    for extra precision, in case the IP is ever reused for another purpose.
+
+.EXAMPLE
+    .\New-ScannerSpamBypassRule.ps1 -SenderIPAddress "203.0.113.10"
+
+.EXAMPLE
+    .\New-ScannerSpamBypassRule.ps1 -SenderIPAddress "203.0.113.10" -SenderAddress "scanner@contoso.com"
+#>
+
+[CmdletBinding(SupportsShouldProcess)]
+param(
+    [Parameter()]
+    [string]$RuleName = "Bypass spam filtering - Scanner relay",
+
+    [Parameter(Mandatory = $true)]
+    [string[]]$SenderIPAddress,
+
+    [Parameter()]
+    [string]$SenderAddress
+)
+
+try {
+    $null = Get-ConnectionInformation -ErrorAction Stop
+}
+catch {
+    throw "No active Exchange Online PowerShell session found. Run Connect-ExchangeOnline first."
+}
+
+$existing = Get-TransportRule -Identity $RuleName -ErrorAction SilentlyContinue
+if ($existing) {
+    Write-Warning "A transport rule named '$RuleName' already exists. No changes made. Use Set-TransportRule to modify it, or choose a different -RuleName."
+    return
+}
+
+$ruleParams = @{
+    Name           = $RuleName
+    SenderIpRanges = $SenderIPAddress
+    SetSCL         = -1
+}
+
+if ($SenderAddress) {
+    $ruleParams["From"] = $SenderAddress
+}
+
+if ($PSCmdlet.ShouldProcess($RuleName, "Create Exchange Online transport rule")) {
+    New-TransportRule @ruleParams
+    $suffix = if ($SenderAddress) { " and sender $SenderAddress" } else { "" }
+    Write-Host "Created transport rule '$RuleName' for IP(s): $($SenderIPAddress -join ', ')$suffix" -ForegroundColor Green
+}
