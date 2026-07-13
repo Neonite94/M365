@@ -1,0 +1,75 @@
+<#
+.SYNOPSIS
+    Creates an Exchange Online Inbound Connector to allow anonymous SMTP relay from a specific IP address (e.g. a scan-to-email capable printer/MFP).
+
+.DESCRIPTION
+    Multifunction devices (scanners/printers) often can't authenticate with modern SMTP AUTH.
+    This script creates an IP-restricted Inbound Connector in Exchange Online that allows
+    anonymous relay ONLY from the specified sender IP address(es), for delivery to any
+    accepted domain in the tenant (internal or external recipients).
+
+    Requires an active Exchange Online PowerShell session (Connect-ExchangeOnline) with
+    sufficient permissions (Organization Management or Exchange Administrator role).
+
+.PARAMETER ConnectorName
+    Name of the Inbound Connector to create. Defaults to "Scanner-SMTP-Relay".
+
+.PARAMETER SenderIPAddress
+    One or more public IP addresses or CIDR ranges allowed to relay through this connector.
+    Use the narrowest range possible (ideally a single static IP or /32).
+
+.PARAMETER RequireTls
+    Whether to require TLS for the incoming connection. Most scan/print devices don't support
+    this reliably, so it defaults to $false. Set to $true if your device supports TLS.
+
+.EXAMPLE
+    .\New-ScannerInboundConnector.ps1 -SenderIPAddress "203.0.113.10"
+
+.EXAMPLE
+    .\New-ScannerInboundConnector.ps1 -ConnectorName "MFP-Relay-HQ" -SenderIPAddress "203.0.113.0/29" -RequireTls $true
+
+.NOTES
+    After creating the connector, test with:
+        Test-NetConnection -ComputerName <tenant>.mail.protection.outlook.com -Port 25
+    and a manual SMTP session or Send-MailMessage, before pointing real devices at it.
+#>
+
+[CmdletBinding(SupportsShouldProcess)]
+param(
+    [Parameter()]
+    [string]$ConnectorName = "Scanner-SMTP-Relay",
+
+    [Parameter(Mandatory = $true)]
+    [string[]]$SenderIPAddress,
+
+    [Parameter()]
+    [bool]$RequireTls = $false
+)
+
+# Confirm there's an active Exchange Online session
+try {
+    $null = Get-ConnectionInformation -ErrorAction Stop
+}
+catch {
+    throw "No active Exchange Online PowerShell session found. Run Connect-ExchangeOnline first."
+}
+
+# Don't silently overwrite an existing connector with the same name
+$existing = Get-InboundConnector -Identity $ConnectorName -ErrorAction SilentlyContinue
+if ($existing) {
+    Write-Warning "An inbound connector named '$ConnectorName' already exists. No changes made. Use Set-InboundConnector to modify it, or choose a different -ConnectorName."
+    return
+}
+
+if ($PSCmdlet.ShouldProcess($ConnectorName, "Create Exchange Online Inbound Connector")) {
+    New-InboundConnector -Name $ConnectorName `
+        -ConnectorType OnPremises `
+        -SenderDomains "*" `
+        -SenderIPAddresses $SenderIPAddress `
+        -RestrictDomainsToIPAddresses $true `
+        -RequireTls $RequireTls `
+        -CloudServicesMailEnabled $false `
+        -Enabled $true
+
+    Write-Host "Created inbound connector '$ConnectorName' restricted to: $($SenderIPAddress -join ', ')" -ForegroundColor Green
+}
